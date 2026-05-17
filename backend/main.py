@@ -22,11 +22,18 @@ from pydantic import BaseModel, EmailStr
 from PIL import Image, ImageDraw, ImageFont
 import openpyxl
 from dotenv import load_dotenv
-
+import cloudinary
+import cloudinary.uploader
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
 load_dotenv()
+cloudinary.config(secure=True)
+
+PUBLIC_BASE_URL = os.getenv(
+    "PUBLIC_BASE_URL",
+    "https://sigg-certi-backend.onrender.com"
+).rstrip("/")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -363,17 +370,37 @@ async def upload_files(
     job_dir = OUTPUT_DIR / job_id
     job_dir.mkdir(exist_ok=True)
 
-    # save template
+    # validate template
     tpl_ext = Path(template.filename).suffix.lower() or ".jpg"
     if tpl_ext not in {".jpg", ".jpeg", ".png"}:
         raise HTTPException(400, "Template must be JPG or PNG.")
-    tpl_path = UPLOADS_DIR / f"{job_id}_template{tpl_ext}"
+
+    # read template bytes
     tpl_bytes = await template.read()
+
+    # save temporary local copy for PIL processing
+    tpl_path = UPLOADS_DIR / f"{job_id}_template{tpl_ext}"
     tpl_path.write_bytes(tpl_bytes)
+
+    # upload template to Cloudinary for permanent preview URL
+    try:
+        upload_result = cloudinary.uploader.upload(
+            io.BytesIO(tpl_bytes),
+            folder="siggraph_certificate_templates",
+            public_id=f"{job_id}_template",
+            resource_type="image",
+            overwrite=True,
+        )
+        template_cloudinary_url = upload_result["secure_url"]
+        template_public_id = upload_result["public_id"]
+    except Exception as e:
+        logger.exception(f"Cloudinary upload failed: {e}")
+        raise HTTPException(500, f"Cloudinary upload failed: {str(e)}")
 
     # parse recipients
     rec_bytes = await recipients.read()
     rec_name = (recipients.filename or "").lower()
+
     if rec_name.endswith(".csv"):
         recs = _parse_recipients_from_csv(rec_bytes)
     elif rec_name.endswith((".xlsx", ".xls")):
@@ -384,37 +411,47 @@ async def upload_files(
     if not recs:
         raise HTTPException(400, "No valid rows found in recipient list.")
 
-    # Probe image to expose dimensions to the frontend (helps coordinate picker)
+    # get image dimensions
     with Image.open(tpl_path) as im:
         width, height = im.size
 
     JOBS[job_id] = {
         "job_id": job_id,
         "template_path": str(tpl_path),
+        "template_url": template_cloudinary_url,
+        "template_public_id": template_public_id,
         "template_width": width,
         "template_height": height,
         "recipients": recs,
         "certificates": [],
         "email_status": "idle",
     }
+
     logger.info(f"Created job {job_id} with {len(recs)} recipients ({width}x{height})")
 
     return {
         "job_id": job_id,
         "recipient_count": len(recs),
-        "recipients": recs[:5],            # preview first 5
+        "recipients": recs[:5],
         "template_width": width,
         "template_height": height,
-        "template_url": f"/api/template/{job_id}",
-    }
 
+        # frontend should use this directly in <img src="">
+        "template_url": template_cloudinary_url,
+    }
 
 @app.get("/api/template/{job_id}")
 async def get_template(job_id: str):
     if job_id not in JOBS:
         raise HTTPException(404, "Job not found")
-    return FileResponse(JOBS[job_id]["template_path"])
 
+    job = JOBS[job_id]
+
+    return {
+        "template_url": job.get("template_url"),
+        "template_width": job.get("template_width"),
+        "template_height": job.get("template_height"),
+    }
 
 @app.post("/api/preview")
 async def preview_certificate(req: GenerateRequest):
@@ -442,9 +479,9 @@ async def preview_certificate(req: GenerateRequest):
     job["config"] = req.dict()
 
     return {
-        "preview_url": f"/files/{req.job_id}/preview.jpg",
-        "sample_name": sample_name,
-    }
+    "preview_url": f"{PUBLIC_BASE_URL}/files/{req.job_id}/preview.jpg",
+    "sample_name": sample_name,
+}
 
 
 @app.post("/api/generate")
@@ -482,7 +519,7 @@ async def generate_certificates(req: GenerateRequest):
             "name": rec["name"],
             "email": rec["email"],
             "filename": filename,
-            "url": f"/files/{req.job_id}/{filename}",
+            "url": f"{PUBLIC_BASE_URL}/files/{req.job_id}/{filename}",
         })
 
     job["certificates"] = certs
