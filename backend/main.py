@@ -28,6 +28,8 @@ import cloudinary.uploader
 # Setup
 # ---------------------------------------------------------------------------
 load_dotenv()
+
+# Cloudinary reads CLOUDINARY_URL automatically from .env / Render env
 cloudinary.config(secure=True)
 
 PUBLIC_BASE_URL = os.getenv(
@@ -273,7 +275,6 @@ def _smtp_config() -> Dict[str, Any]:
         "use_tls": os.getenv("SMTP_USE_TLS", "true").lower() == "true",
     }
 
-
 def _send_one_email(
     cfg: Dict[str, Any],
     to_email: str,
@@ -378,7 +379,7 @@ async def upload_files(
     # read template bytes
     tpl_bytes = await template.read()
 
-    # save temporary local copy for PIL processing
+    # save temporary local copy for PIL generation
     tpl_path = UPLOADS_DIR / f"{job_id}_template{tpl_ext}"
     tpl_path.write_bytes(tpl_bytes)
 
@@ -391,8 +392,10 @@ async def upload_files(
             resource_type="image",
             overwrite=True,
         )
+
         template_cloudinary_url = upload_result["secure_url"]
         template_public_id = upload_result["public_id"]
+
     except Exception as e:
         logger.exception(f"Cloudinary upload failed: {e}")
         raise HTTPException(500, f"Cloudinary upload failed: {str(e)}")
@@ -435,11 +438,8 @@ async def upload_files(
         "recipients": recs[:5],
         "template_width": width,
         "template_height": height,
-
-        # frontend should use this directly in <img src="">
         "template_url": template_cloudinary_url,
     }
-
 @app.get("/api/template/{job_id}")
 async def get_template(job_id: str):
     if job_id not in JOBS:
