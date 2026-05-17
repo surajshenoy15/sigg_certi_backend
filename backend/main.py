@@ -2,21 +2,24 @@
 SIGGRAPH BNMIT - Certificate Generator Backend
 FastAPI service for generating personalized certificates and emailing them.
 """
+
 import os
 import io
 import csv
 import uuid
+import json
 import asyncio
 import smtplib
 import logging
+import urllib.request
 from email.message import EmailMessage
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Dict, Any
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
 from PIL import Image, ImageDraw, ImageFont
@@ -24,6 +27,8 @@ import openpyxl
 from dotenv import load_dotenv
 import cloudinary
 import cloudinary.uploader
+
+
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
@@ -51,8 +56,72 @@ FONTS_DIR = BASE_DIR / "fonts"
 for d in (UPLOADS_DIR, OUTPUT_DIR, FONTS_DIR):
     d.mkdir(exist_ok=True)
 
-# In-memory job registry. For production swap with Redis/DB.
+# In-memory job registry
 JOBS: Dict[str, Dict[str, Any]] = {}
+
+
+# ---------------------------------------------------------------------------
+# Job persistence helpers
+# ---------------------------------------------------------------------------
+def _job_file(job_id: str) -> Path:
+    return OUTPUT_DIR / job_id / "job.json"
+
+
+def _save_job(job_id: str) -> None:
+    if job_id not in JOBS:
+        return
+
+    path = _job_file(job_id)
+    path.parent.mkdir(exist_ok=True)
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(JOBS[job_id], f, ensure_ascii=False, indent=2)
+
+
+def _get_job(job_id: str) -> Dict[str, Any]:
+    if job_id in JOBS:
+        return JOBS[job_id]
+
+    path = _job_file(job_id)
+
+    if path.exists():
+        with open(path, "r", encoding="utf-8") as f:
+            job = json.load(f)
+
+        JOBS[job_id] = job
+        return job
+
+    raise HTTPException(
+        404,
+        f"Job not found: {job_id}. Please upload the template and recipient file again."
+    )
+
+
+def _ensure_template_exists(job: Dict[str, Any]) -> Path:
+    template_path = Path(job["template_path"])
+
+    if template_path.exists():
+        return template_path
+
+    template_url = job.get("template_url")
+
+    if not template_url:
+        raise HTTPException(
+            404,
+            "Template file missing and no Cloudinary URL found."
+        )
+
+    template_path.parent.mkdir(exist_ok=True)
+
+    try:
+        urllib.request.urlretrieve(template_url, template_path)
+    except Exception as e:
+        raise HTTPException(
+            500,
+            f"Could not restore template from Cloudinary: {str(e)}"
+        )
+
+    return template_path
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +143,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS - allow your Vite dev server and anything else you configure
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
     "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173,https://sigg-certi-frontend.vercel.app",
@@ -100,44 +168,43 @@ class Recipient(BaseModel):
     email: EmailStr
 
 
-class PreviewRequest(BaseModel):
-    job_id: str
-    name: str = "Sample Name"
-
-
 class GenerateRequest(BaseModel):
     job_id: str
-    name_x: int           # X coordinate (in pixels) where name text is centered
-    name_y: int           # Y coordinate (in pixels) where name text baseline sits
+    name_x: int
+    name_y: int
     font_size: int = 64
-    font_color: str = "#5B3FD9"   # hex
-    font_family: str = "default"  # "default" | "serif" | "mono" | uploaded
+    font_color: str = "#5B3FD9"
+    font_family: str = "default"
 
 
 class SendEmailRequest(BaseModel):
     job_id: str
     subject: str
-    body: str             # Plain-text body. {{name}} placeholder supported.
+    body: str
     sender_name: str = "SIGGRAPH BNMIT"
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# File parsing helpers
 # ---------------------------------------------------------------------------
-def _parse_recipients_from_csv(content: bytes) -> List[Recipient]:
+def _parse_recipients_from_csv(content: bytes) -> List[Dict[str, str]]:
     text = content.decode("utf-8-sig", errors="replace")
     reader = csv.DictReader(io.StringIO(text))
-    rows = []
-    # normalize header lookup
-    fieldnames = [(f or "").strip().lower() for f in (reader.fieldnames or [])]
-    if not fieldnames:
+
+    if not reader.fieldnames:
         raise HTTPException(400, "CSV has no header row.")
 
     name_keys = {"name", "full name", "student name", "participant", "participant name"}
     email_keys = {"email", "email id", "e-mail", "email address", "mail"}
 
-    name_field = next((f for f in reader.fieldnames if f.strip().lower() in name_keys), None)
-    email_field = next((f for f in reader.fieldnames if f.strip().lower() in email_keys), None)
+    name_field = next(
+        (f for f in reader.fieldnames if f and f.strip().lower() in name_keys),
+        None
+    )
+    email_field = next(
+        (f for f in reader.fieldnames if f and f.strip().lower() in email_keys),
+        None
+    )
 
     if not name_field or not email_field:
         raise HTTPException(
@@ -145,13 +212,21 @@ def _parse_recipients_from_csv(content: bytes) -> List[Recipient]:
             f"CSV must contain 'name' and 'email' columns. Got: {reader.fieldnames}",
         )
 
+    rows = []
+
     for i, row in enumerate(reader, start=2):
         name = (row.get(name_field) or "").strip()
         email = (row.get(email_field) or "").strip()
+
         if not name or not email:
-            logger.warning(f"Row {i} skipped (missing data): {row}")
+            logger.warning(f"Row {i} skipped because name/email missing: {row}")
             continue
-        rows.append({"name": name, "email": email})
+
+        rows.append({
+            "name": name,
+            "email": email,
+        })
+
     return rows
 
 
@@ -159,12 +234,14 @@ def _parse_recipients_from_xlsx(content: bytes) -> List[Dict[str, str]]:
     wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
     ws = wb.active
     rows_iter = ws.iter_rows(values_only=True)
+
     try:
         header = next(rows_iter)
     except StopIteration:
         raise HTTPException(400, "Spreadsheet is empty.")
 
     header_norm = [str(h).strip().lower() if h else "" for h in header]
+
     name_keys = {"name", "full name", "student name", "participant", "participant name"}
     email_keys = {"email", "email id", "e-mail", "email address", "mail"}
 
@@ -178,23 +255,32 @@ def _parse_recipients_from_xlsx(content: bytes) -> List[Dict[str, str]]:
         )
 
     rows = []
+
     for r in rows_iter:
         if not r:
             continue
-        name = (str(r[name_idx]).strip() if r[name_idx] is not None else "")
-        email = (str(r[email_idx]).strip() if r[email_idx] is not None else "")
+
+        name = str(r[name_idx]).strip() if r[name_idx] is not None else ""
+        email = str(r[email_idx]).strip() if r[email_idx] is not None else ""
+
         if not name or not email:
             continue
-        rows.append({"name": name, "email": email})
+
+        rows.append({
+            "name": name,
+            "email": email,
+        })
+
     return rows
 
 
+# ---------------------------------------------------------------------------
+# Certificate rendering helpers
+# ---------------------------------------------------------------------------
 def _load_font(family: str, size: int) -> ImageFont.FreeTypeFont:
-    """Try to load a real TTF; fall back gracefully."""
     candidates = []
     family = (family or "default").lower()
 
-    # Allow project-local fonts
     if family == "default":
         candidates += [
             FONTS_DIR / "Poppins-Bold.ttf",
@@ -206,12 +292,12 @@ def _load_font(family: str, size: int) -> ImageFont.FreeTypeFont:
             FONTS_DIR / "DejaVuSerif-Bold.ttf",
         ]
     elif family == "mono":
-        candidates += [FONTS_DIR / "DejaVuSansMono-Bold.ttf"]
+        candidates += [
+            FONTS_DIR / "DejaVuSansMono-Bold.ttf",
+        ]
     else:
-        # Treat as a custom filename
         candidates.append(FONTS_DIR / family)
 
-    # System fallbacks
     candidates += [
         Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
         Path("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"),
@@ -226,15 +312,20 @@ def _load_font(family: str, size: int) -> ImageFont.FreeTypeFont:
         except Exception:
             continue
 
-    logger.warning("No TTF found, falling back to PIL default font (size ignored).")
+    logger.warning("No TTF font found. Falling back to PIL default font.")
     return ImageFont.load_default()
 
 
 def _hex_to_rgb(hex_color: str) -> tuple:
-    h = hex_color.lstrip("#")
+    h = hex_color.strip().lstrip("#")
+
     if len(h) == 3:
         h = "".join(c * 2 for c in h)
-    return tuple(int(h[i : i + 2], 16) for i in (0, 2, 4))
+
+    if len(h) != 6:
+        return (91, 63, 217)
+
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
 
 
 def _render_certificate(
@@ -251,19 +342,20 @@ def _render_certificate(
     font = _load_font(font_family, font_size)
     color = _hex_to_rgb(font_color)
 
-    # Measure & center horizontally at name_x
     bbox = draw.textbbox((0, 0), name, font=font)
     text_w = bbox[2] - bbox[0]
     text_h = bbox[3] - bbox[1]
+
     x = name_x - text_w / 2
     y = name_y - text_h / 2
 
     draw.text((x, y), name, fill=color, font=font)
+
     return img
 
 
 # ---------------------------------------------------------------------------
-# Email
+# Email helpers
 # ---------------------------------------------------------------------------
 def _smtp_config() -> Dict[str, Any]:
     return {
@@ -274,6 +366,7 @@ def _smtp_config() -> Dict[str, Any]:
         "from_email": os.getenv("SMTP_FROM", os.getenv("SMTP_USER", "")),
         "use_tls": os.getenv("SMTP_USE_TLS", "true").lower() == "true",
     }
+
 
 def _send_one_email(
     cfg: Dict[str, Any],
@@ -299,43 +392,61 @@ def _send_one_email(
         )
 
     try:
-        with smtplib.SMTP(cfg["host"], cfg["port"], timeout=15) as server:
-            server.set_debuglevel(1)
-            server.ehlo()
-
-            if cfg["use_tls"]:
-                server.starttls()
+        if cfg["port"] == 465:
+            with smtplib.SMTP_SSL(cfg["host"], cfg["port"], timeout=15) as server:
+                server.login(cfg["user"], cfg["password"])
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(cfg["host"], cfg["port"], timeout=15) as server:
                 server.ehlo()
 
-            server.login(cfg["user"], cfg["password"])
-            server.send_message(msg)
+                if cfg["use_tls"]:
+                    server.starttls()
+                    server.ehlo()
+
+                server.login(cfg["user"], cfg["password"])
+                server.send_message(msg)
 
     except smtplib.SMTPAuthenticationError as e:
-        raise Exception("Gmail authentication failed. Check SMTP_USER and SMTP_PASSWORD App Password.") from e
+        raise Exception(
+            "Gmail authentication failed. Check SMTP_USER and SMTP_PASSWORD App Password."
+        ) from e
 
     except smtplib.SMTPConnectError as e:
-        raise Exception("Could not connect to Gmail SMTP server.") from e
+        raise Exception(
+            "Could not connect to Gmail SMTP server."
+        ) from e
 
     except TimeoutError as e:
-        raise Exception("SMTP connection timed out.") from e
+        raise Exception(
+            "SMTP connection timed out."
+        ) from e
 
     except OSError as e:
-        raise Exception(f"Network error while connecting to Gmail SMTP: {e}") from e
+        raise Exception(
+            f"Network error while connecting to Gmail SMTP: {e}"
+        ) from e
+
 
 async def _send_emails_task(job_id: str, subject: str, body: str, sender_name: str):
-    job = JOBS[job_id]
+    job = _get_job(job_id)
     cfg = _smtp_config()
+
     if not cfg["user"] or not cfg["password"]:
         job["email_status"] = "failed"
-        job["email_error"] = "SMTP not configured. Set SMTP_USER and SMTP_PASSWORD in .env"
+        job["email_error"] = "SMTP not configured. Set SMTP_USER and SMTP_PASSWORD."
+        JOBS[job_id] = job
+        _save_job(job_id)
         return
 
     job["email_status"] = "sending"
     job["sent"] = 0
     job["failed"] = 0
     job["email_log"] = []
+    JOBS[job_id] = job
+    _save_job(job_id)
 
-    for cert in job["certificates"]:
+    for cert in job.get("certificates", []):
         try:
             await asyncio.to_thread(
                 _send_one_email,
@@ -347,15 +458,31 @@ async def _send_emails_task(job_id: str, subject: str, body: str, sender_name: s
                 sender_name,
                 OUTPUT_DIR / job_id / cert["filename"],
             )
+
             job["sent"] += 1
-            job["email_log"].append({"email": cert["email"], "status": "sent"})
+            job["email_log"].append({
+                "email": cert["email"],
+                "status": "sent",
+            })
+
             logger.info(f"[{job_id}] sent → {cert['email']}")
+
         except Exception as e:
             job["failed"] += 1
-            job["email_log"].append({"email": cert["email"], "status": "failed", "error": str(e)})
+            job["email_log"].append({
+                "email": cert["email"],
+                "status": "failed",
+                "error": str(e),
+            })
+
             logger.exception(f"[{job_id}] failed → {cert['email']}: {e}")
 
+        JOBS[job_id] = job
+        _save_job(job_id)
+
     job["email_status"] = "completed"
+    JOBS[job_id] = job
+    _save_job(job_id)
 
 
 # ---------------------------------------------------------------------------
@@ -363,42 +490,69 @@ async def _send_emails_task(job_id: str, subject: str, body: str, sender_name: s
 # ---------------------------------------------------------------------------
 @app.get("/")
 async def root():
-    return {"service": "Certificate Generator", "version": "1.0.0", "status": "ok"}
+    return {
+        "service": "Certificate Generator",
+        "version": "1.0.0",
+        "status": "ok",
+    }
 
 
 @app.get("/api/health")
 async def health():
     cfg = _smtp_config()
+
     return {
         "status": "ok",
         "smtp_configured": bool(cfg["user"] and cfg["password"]),
         "smtp_user": cfg["user"] if cfg["user"] else None,
+        "public_base_url": PUBLIC_BASE_URL,
     }
+
+
+@app.get("/api/jobs")
+async def list_jobs():
+    return {
+        "memory_count": len(JOBS),
+        "memory_jobs": list(JOBS.keys()),
+        "saved_jobs": [
+            p.parent.name
+            for p in OUTPUT_DIR.glob("*/job.json")
+        ],
+    }
+
+
+@app.get("/api/routes")
+async def list_routes():
+    return [
+        {
+            "path": route.path,
+            "methods": list(route.methods),
+        }
+        for route in app.routes
+        if hasattr(route, "methods")
+    ]
 
 
 @app.post("/api/upload")
 async def upload_files(
-    template: UploadFile = File(..., description="Certificate template (JPG/PNG)"),
-    recipients: UploadFile = File(..., description="CSV or XLSX with name & email"),
+    template: UploadFile = File(..., description="Certificate template JPG/PNG"),
+    recipients: UploadFile = File(..., description="CSV or XLSX with name and email"),
 ):
-    """Upload template + recipient list. Returns a job_id used by subsequent calls."""
     job_id = uuid.uuid4().hex[:12]
     job_dir = OUTPUT_DIR / job_id
     job_dir.mkdir(exist_ok=True)
 
-    # validate template
-    tpl_ext = Path(template.filename).suffix.lower() or ".jpg"
+    tpl_ext = Path(template.filename or "").suffix.lower() or ".jpg"
+
     if tpl_ext not in {".jpg", ".jpeg", ".png"}:
         raise HTTPException(400, "Template must be JPG or PNG.")
 
-    # read template bytes
     tpl_bytes = await template.read()
 
-    # save temporary local copy for PIL generation
     tpl_path = UPLOADS_DIR / f"{job_id}_template{tpl_ext}"
+    tpl_path.parent.mkdir(exist_ok=True)
     tpl_path.write_bytes(tpl_bytes)
 
-    # upload template to Cloudinary for permanent preview URL
     try:
         upload_result = cloudinary.uploader.upload(
             io.BytesIO(tpl_bytes),
@@ -413,9 +567,11 @@ async def upload_files(
 
     except Exception as e:
         logger.exception(f"Cloudinary upload failed: {e}")
-        raise HTTPException(500, f"Cloudinary upload failed: {str(e)}")
+        raise HTTPException(
+            500,
+            f"Cloudinary upload failed: {str(e)}"
+        )
 
-    # parse recipients
     rec_bytes = await recipients.read()
     rec_name = (recipients.filename or "").lower()
 
@@ -424,12 +580,11 @@ async def upload_files(
     elif rec_name.endswith((".xlsx", ".xls")):
         recs = _parse_recipients_from_xlsx(rec_bytes)
     else:
-        raise HTTPException(400, "Recipients file must be .csv or .xlsx")
+        raise HTTPException(400, "Recipients file must be .csv or .xlsx.")
 
     if not recs:
         raise HTTPException(400, "No valid rows found in recipient list.")
 
-    # get image dimensions
     with Image.open(tpl_path) as im:
         width, height = im.size
 
@@ -443,7 +598,12 @@ async def upload_files(
         "recipients": recs,
         "certificates": [],
         "email_status": "idle",
+        "sent": 0,
+        "failed": 0,
+        "email_log": [],
     }
+
+    _save_job(job_id)
 
     logger.info(f"Created job {job_id} with {len(recs)} recipients ({width}x{height})")
 
@@ -455,12 +615,11 @@ async def upload_files(
         "template_height": height,
         "template_url": template_cloudinary_url,
     }
+
+
 @app.get("/api/template/{job_id}")
 async def get_template(job_id: str):
-    if job_id not in JOBS:
-        raise HTTPException(404, "Job not found")
-
-    job = JOBS[job_id]
+    job = _get_job(job_id)
 
     return {
         "template_url": job.get("template_url"),
@@ -468,17 +627,16 @@ async def get_template(job_id: str):
         "template_height": job.get("template_height"),
     }
 
+
 @app.post("/api/preview")
 async def preview_certificate(req: GenerateRequest):
-    """Render a single sample cert so the user can verify placement before bulk."""
-    if req.job_id not in JOBS:
-        raise HTTPException(404, "Job not found")
+    job = _get_job(req.job_id)
+    template_path = _ensure_template_exists(job)
 
-    job = JOBS[req.job_id]
-    sample_name = job["recipients"][0]["name"] if job["recipients"] else "Sample Name"
+    sample_name = job["recipients"][0]["name"] if job.get("recipients") else "Sample Name"
 
     img = _render_certificate(
-        Path(job["template_path"]),
+        template_path,
         sample_name,
         req.name_x,
         req.name_y,
@@ -486,31 +644,31 @@ async def preview_certificate(req: GenerateRequest):
         req.font_color,
         req.font_family,
     )
+
     preview_path = OUTPUT_DIR / req.job_id / "preview.jpg"
     preview_path.parent.mkdir(exist_ok=True)
     img.save(preview_path, "JPEG", quality=92)
 
-    # Save the chosen config on the job
     job["config"] = req.dict()
+    JOBS[req.job_id] = job
+    _save_job(req.job_id)
 
     return {
-    "preview_url": f"{PUBLIC_BASE_URL}/files/{req.job_id}/preview.jpg",
-    "sample_name": sample_name,
-}
+        "preview_url": f"{PUBLIC_BASE_URL}/files/{req.job_id}/preview.jpg",
+        "sample_name": sample_name,
+    }
 
 
 @app.post("/api/generate")
 async def generate_certificates(req: GenerateRequest):
-    """Render one certificate per recipient."""
-    if req.job_id not in JOBS:
-        raise HTTPException(404, "Job not found")
+    job = _get_job(req.job_id)
+    template_path = _ensure_template_exists(job)
 
-    job = JOBS[req.job_id]
     out_dir = OUTPUT_DIR / req.job_id
     out_dir.mkdir(exist_ok=True)
-    template_path = Path(job["template_path"])
 
     certs = []
+
     for rec in job["recipients"]:
         img = _render_certificate(
             template_path,
@@ -521,15 +679,21 @@ async def generate_certificates(req: GenerateRequest):
             req.font_color,
             req.font_family,
         )
-        # sanitize filename
-        safe = "".join(c if c.isalnum() or c in "-_ " else "_" for c in rec["name"]).strip()
+
+        safe = "".join(
+            c if c.isalnum() or c in "-_ " else "_"
+            for c in rec["name"]
+        ).strip()
+
         filename = f"{safe or 'certificate'}.jpg"
-        # avoid collisions
+
         counter = 1
         while (out_dir / filename).exists():
             filename = f"{safe}_{counter}.jpg"
             counter += 1
+
         img.save(out_dir / filename, "JPEG", quality=92)
+
         certs.append({
             "name": rec["name"],
             "email": rec["email"],
@@ -539,31 +703,52 @@ async def generate_certificates(req: GenerateRequest):
 
     job["certificates"] = certs
     job["config"] = req.dict()
+    job["email_status"] = "idle"
+    job["sent"] = 0
+    job["failed"] = 0
+    job["email_log"] = []
+
+    JOBS[req.job_id] = job
+    _save_job(req.job_id)
+
     logger.info(f"[{req.job_id}] generated {len(certs)} certificates")
-    return {"job_id": req.job_id, "count": len(certs), "certificates": certs}
+
+    return {
+        "job_id": req.job_id,
+        "count": len(certs),
+        "certificates": certs,
+    }
 
 
 @app.post("/api/send")
 async def send_emails(req: SendEmailRequest, background: BackgroundTasks):
-    """Email the generated certificates as attachments. Runs in background."""
-    if req.job_id not in JOBS:
-        raise HTTPException(404, "Job not found")
-    job = JOBS[req.job_id]
+    job = _get_job(req.job_id)
+
     if not job.get("certificates"):
         raise HTTPException(400, "Generate certificates first.")
 
-    background.add_task(_send_emails_task, req.job_id, req.subject, req.body, req.sender_name)
-    return {"status": "queued", "job_id": req.job_id, "total": len(job["certificates"])}
+    background.add_task(
+        _send_emails_task,
+        req.job_id,
+        req.subject,
+        req.body,
+        req.sender_name,
+    )
+
+    return {
+        "status": "queued",
+        "job_id": req.job_id,
+        "total": len(job["certificates"]),
+    }
 
 
 @app.get("/api/status/{job_id}")
 async def get_status(job_id: str):
-    if job_id not in JOBS:
-        raise HTTPException(404, "Job not found")
-    job = JOBS[job_id]
+    job = _get_job(job_id)
+
     return {
         "job_id": job_id,
-        "recipient_count": len(job["recipients"]),
+        "recipient_count": len(job.get("recipients", [])),
         "generated": len(job.get("certificates", [])),
         "email_status": job.get("email_status", "idle"),
         "sent": job.get("sent", 0),
@@ -575,20 +760,33 @@ async def get_status(job_id: str):
 
 @app.get("/api/download/{job_id}")
 async def download_all(job_id: str):
-    """Zip everything up for download."""
-    if job_id not in JOBS:
-        raise HTTPException(404, "Job not found")
+    job = _get_job(job_id)
+
     import zipfile
+
     src_dir = OUTPUT_DIR / job_id
     zip_path = OUTPUT_DIR / f"{job_id}_certificates.zip"
+
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for cert in JOBS[job_id].get("certificates", []):
+        for cert in job.get("certificates", []):
             p = src_dir / cert["filename"]
+
             if p.exists():
                 zf.write(p, cert["filename"])
-    return FileResponse(zip_path, filename=f"certificates_{job_id}.zip", media_type="application/zip")
+
+    return FileResponse(
+        zip_path,
+        filename=f"certificates_{job_id}.zip",
+        media_type="application/zip",
+    )
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+    )
