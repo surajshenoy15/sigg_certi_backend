@@ -298,14 +298,29 @@ def _send_one_email(
             filename=f"{to_name}_certificate.jpg",
         )
 
-    with smtplib.SMTP(cfg["host"], cfg["port"], timeout=30) as server:
-        server.ehlo()
-        if cfg["use_tls"]:
-            server.starttls()
+    try:
+        with smtplib.SMTP(cfg["host"], cfg["port"], timeout=15) as server:
+            server.set_debuglevel(1)
             server.ehlo()
-        server.login(cfg["user"], cfg["password"])
-        server.send_message(msg)
 
+            if cfg["use_tls"]:
+                server.starttls()
+                server.ehlo()
+
+            server.login(cfg["user"], cfg["password"])
+            server.send_message(msg)
+
+    except smtplib.SMTPAuthenticationError as e:
+        raise Exception("Gmail authentication failed. Check SMTP_USER and SMTP_PASSWORD App Password.") from e
+
+    except smtplib.SMTPConnectError as e:
+        raise Exception("Could not connect to Gmail SMTP server.") from e
+
+    except TimeoutError as e:
+        raise Exception("SMTP connection timed out.") from e
+
+    except OSError as e:
+        raise Exception(f"Network error while connecting to Gmail SMTP: {e}") from e
 
 async def _send_emails_task(job_id: str, subject: str, body: str, sender_name: str):
     job = JOBS[job_id]
