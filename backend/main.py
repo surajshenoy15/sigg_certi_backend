@@ -8,25 +8,26 @@ import io
 import csv
 import uuid
 import json
+import base64
 import asyncio
-import smtplib
 import logging
 import urllib.request
-from email.message import EmailMessage
 from pathlib import Path
 from typing import List, Dict, Any
 from contextlib import asynccontextmanager
 
+import requests
+import openpyxl
+import cloudinary
+import cloudinary.uploader
+
+from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
 from PIL import Image, ImageDraw, ImageFont
-import openpyxl
-from dotenv import load_dotenv
-import cloudinary
-import cloudinary.uploader
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +57,7 @@ FONTS_DIR = BASE_DIR / "fonts"
 for d in (UPLOADS_DIR, OUTPUT_DIR, FONTS_DIR):
     d.mkdir(exist_ok=True)
 
-# In-memory job registry
+# In-memory job registry + JSON backup
 JOBS: Dict[str, Dict[str, Any]] = {}
 
 
@@ -156,7 +157,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve generated certs for download/preview
 app.mount("/files", StaticFiles(directory=OUTPUT_DIR), name="files")
 
 
@@ -355,21 +355,17 @@ def _render_certificate(
 
 
 # ---------------------------------------------------------------------------
-# Email helpers
+# Brevo email helpers
 # ---------------------------------------------------------------------------
-def _smtp_config() -> Dict[str, Any]:
+def _brevo_config() -> Dict[str, str]:
     return {
-        "host": os.getenv("SMTP_HOST", "smtp.gmail.com"),
-        "port": int(os.getenv("SMTP_PORT", "587")),
-        "user": os.getenv("SMTP_USER", ""),
-        "password": os.getenv("SMTP_PASSWORD", ""),
-        "from_email": os.getenv("SMTP_FROM", os.getenv("SMTP_USER", "")),
-        "use_tls": os.getenv("SMTP_USE_TLS", "true").lower() == "true",
+        "api_key": os.getenv("BREVO_API_KEY", ""),
+        "sender_email": os.getenv("BREVO_SENDER_EMAIL", ""),
+        "sender_name": os.getenv("BREVO_SENDER_NAME", "SIGGRAPH BNMIT"),
     }
 
 
 def _send_one_email(
-    cfg: Dict[str, Any],
     to_email: str,
     to_name: str,
     subject: str,
@@ -377,64 +373,77 @@ def _send_one_email(
     sender_name: str,
     attachment_path: Path,
 ) -> None:
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = f"{sender_name} <{cfg['from_email']}>"
-    msg["To"] = to_email
-    msg.set_content(body.replace("{{name}}", to_name).replace("{{Name}}", to_name))
+    cfg = _brevo_config()
+
+    if not cfg["api_key"]:
+        raise Exception("BREVO_API_KEY is not configured.")
+
+    if not cfg["sender_email"]:
+        raise Exception("BREVO_SENDER_EMAIL is not configured.")
+
+    personalized_body = body.replace("{{name}}", to_name).replace("{{Name}}", to_name)
 
     with open(attachment_path, "rb") as f:
-        msg.add_attachment(
-            f.read(),
-            maintype="image",
-            subtype="jpeg",
-            filename=f"{to_name}_certificate.jpg",
-        )
+        encoded_attachment = base64.b64encode(f.read()).decode("utf-8")
+
+    payload = {
+        "sender": {
+            "name": cfg["sender_name"] or sender_name,
+            "email": cfg["sender_email"],
+        },
+        "to": [
+            {
+                "email": to_email,
+                "name": to_name,
+            }
+        ],
+        "subject": subject,
+        "textContent": personalized_body,
+        "attachment": [
+            {
+                "content": encoded_attachment,
+                "name": f"{to_name}_certificate.jpg",
+            }
+        ],
+    }
+
+    headers = {
+        "accept": "application/json",
+        "api-key": cfg["api_key"],
+        "content-type": "application/json",
+    }
 
     try:
-        if cfg["port"] == 465:
-            with smtplib.SMTP_SSL(cfg["host"], cfg["port"], timeout=15) as server:
-                server.login(cfg["user"], cfg["password"])
-                server.send_message(msg)
-        else:
-            with smtplib.SMTP(cfg["host"], cfg["port"], timeout=15) as server:
-                server.ehlo()
+        response = requests.post(
+            "https://api.brevo.com/v3/smtp/email",
+            json=payload,
+            headers=headers,
+            timeout=30,
+        )
 
-                if cfg["use_tls"]:
-                    server.starttls()
-                    server.ehlo()
+        if response.status_code not in (200, 201, 202):
+            raise Exception(
+                f"Brevo failed with status {response.status_code}: {response.text}"
+            )
 
-                server.login(cfg["user"], cfg["password"])
-                server.send_message(msg)
-
-    except smtplib.SMTPAuthenticationError as e:
-        raise Exception(
-            "Gmail authentication failed. Check SMTP_USER and SMTP_PASSWORD App Password."
-        ) from e
-
-    except smtplib.SMTPConnectError as e:
-        raise Exception(
-            "Could not connect to Gmail SMTP server."
-        ) from e
-
-    except TimeoutError as e:
-        raise Exception(
-            "SMTP connection timed out."
-        ) from e
-
-    except OSError as e:
-        raise Exception(
-            f"Network error while connecting to Gmail SMTP: {e}"
-        ) from e
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Brevo network/API error: {str(e)}") from e
 
 
 async def _send_emails_task(job_id: str, subject: str, body: str, sender_name: str):
     job = _get_job(job_id)
-    cfg = _smtp_config()
+    cfg = _brevo_config()
 
-    if not cfg["user"] or not cfg["password"]:
+    if not cfg["api_key"]:
         job["email_status"] = "failed"
-        job["email_error"] = "SMTP not configured. Set SMTP_USER and SMTP_PASSWORD."
+        job["email_error"] = "BREVO_API_KEY not configured."
+        JOBS[job_id] = job
+        _save_job(job_id)
+        return
+
+    if not cfg["sender_email"]:
+        job["email_status"] = "failed"
+        job["email_error"] = "BREVO_SENDER_EMAIL not configured."
         JOBS[job_id] = job
         _save_job(job_id)
         return
@@ -450,7 +459,6 @@ async def _send_emails_task(job_id: str, subject: str, body: str, sender_name: s
         try:
             await asyncio.to_thread(
                 _send_one_email,
-                cfg,
                 cert["email"],
                 cert["name"],
                 subject,
@@ -499,12 +507,12 @@ async def root():
 
 @app.get("/api/health")
 async def health():
-    cfg = _smtp_config()
+    brevo = _brevo_config()
 
     return {
         "status": "ok",
-        "smtp_configured": bool(cfg["user"] and cfg["password"]),
-        "smtp_user": cfg["user"] if cfg["user"] else None,
+        "brevo_configured": bool(brevo["api_key"] and brevo["sender_email"]),
+        "brevo_sender": brevo["sender_email"] if brevo["sender_email"] else None,
         "public_base_url": PUBLIC_BASE_URL,
     }
 
