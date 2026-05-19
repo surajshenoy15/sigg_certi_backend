@@ -1,0 +1,50 @@
+{
+  "id": "event_H25PJQrPHK",
+  "name": "Arcadde",
+  "date": "May 19th 2026",
+  "created_at": "2026-05-19T08:48:30.941764Z",
+  "registrants": [
+    {
+      "id": "reg_ZDA8G_3m",
+      "name": "Suraj Shenoy",
+      "email": "surajshenoyp@gmail.com",
+      "phone": "",
+      "usn": "",
+      "token": "qkEWPSObun_UN3PHlm3gFA",
+      "invite_sent": true,
+      "invite_sent_at": "2026-05-19T09:24:30.318852Z",
+      "qr_url": "https://sigg-certi-backend.onrender.com/files-qr/event_H25PJQrPHK_reg_ZDA8G_3m_6ecfd5ad.png",
+      "checked_in": false,
+      "checked_in_at": null,
+      "created_at": "2026-05-19T08:50:05.688575Z"
+    },
+    {
+      "id": "reg_75K52vNL",
+      "name": "Sushmitha K Shetty",
+      "email": "sushmithakshetty2005@gmail.com",
+      "phone": "",
+      "usn": "",
+      "token": "QpYi2MvF8wQWw4pgzSaczg",
+      "invite_sent": true,
+      "invite_sent_at": "2026-05-19T09:24:33.922765Z",
+      "qr_url": "https://sigg-certi-backend.onrender.com/files-qr/event_H25PJQrPHK_reg_75K52vNL_6ecfd5ad.png",
+      "checked_in": false,
+      "checked_in_at": null,
+      "created_at": "2026-05-19T08:50:05.688575Z"
+    },
+    {
+      "id": "reg_4c8FjpwX",
+      "name": "P Suraj Shenoy",
+      "email": "surajshenoy296@gmail.com",
+      "phone": "",
+      "usn": "",
+      "token": "BVSTC9Z2rml4blD1qRIkuA",
+      "invite_sent": true,
+      "invite_sent_at": "2026-05-19T09:24:35.383158Z",
+      "qr_url": "https://sigg-certi-backend.onrender.com/files-qr/event_H25PJQrPHK_reg_4c8FjpwX_6ecfd5ad.png",
+      "checked_in": false,
+      "checked_in_at": null,
+      "created_at": "2026-05-19T08:50:05.688575Z"
+    }
+  ]
+}
